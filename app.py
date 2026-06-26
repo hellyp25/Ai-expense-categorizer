@@ -1,163 +1,90 @@
-import streamlit as st
 import pandas as pd
-import google.generativeai as genai
-import json
-import pdfplumber
+import numpy as np
+from sklearn.ensemble import IsolationForest
+from prophet import Prophet
+import warnings
 
-# title
-st.title("Universal CSV & PDF Expense Analyzer")
+warnings.filterwarnings("ignore")
 
-# taking api key
-api_key = st.sidebar.text_input("enter api key", type="password")
 
-if not api_key:
-    st.warning("Please enter Gemini API key.")
-    st.stop()
+class MLEngine:
 
-genai.configure(api_key=api_key)
-model = genai.GenerativeModel("gemini-1.5-flash")
+    @staticmethod
+    def detect_anomalies(
+        df: pd.DataFrame,
+        contamination: float = 0.05
+    ) -> pd.DataFrame:
 
-# category list
-cat = [
-    "Travel",
-    "Food & drinks",
-    "Rent",
-    "Shopping",
-    "Health",
-    "Investment",
-    "Bills",
-    "Other"
-]
+        df = df.copy()
 
-# upload csv or pdf
-data = st.file_uploader("Upload CSV or PDF file", type=["csv", "pdf"])
+        if len(df) < 5:
 
-if data is not None:
+            df["Is_Anomaly"] = False
+            df["Anomaly_Score"] = 0.0
 
-    # ---------------------------
-    # IF CSV
-    # ---------------------------
-    if data.name.endswith(".csv"):
-        df = pd.read_csv(data)
+            return df
 
-    # ---------------------------
-    # IF PDF
-    # ---------------------------
-    elif data.name.endswith(".pdf"):
+        X = np.log1p(np.abs(df[["Amount"]]))
 
-        tables = []
+        model = IsolationForest(
+            contamination=contamination,
+            random_state=42
+        )
 
-        with pdfplumber.open(data) as pdf:
-            for page in pdf.pages:
-                table = page.extract_table()
-                if table:
-                    tables.append(pd.DataFrame(table[1:], columns=table[0]))
+        prediction = model.fit_predict(X)
 
-        if tables:
-            df = pd.concat(tables, ignore_index=True)
-        else:
-            st.error("No table found in PDF.")
-            st.stop()
+        df["Is_Anomaly"] = prediction == -1
 
-    # clean column names
-    df.columns = df.columns.str.strip()
+        df["Anomaly_Score"] = (
+            -model.score_samples(X)
+        ).round(4)
 
-    st.subheader("Raw Data")
-    st.dataframe(df)
+        return df
 
-    # find text and numeric columns
-    text_cols = df.select_dtypes(include=["object"]).columns.tolist()
-    numeric_cols = df.select_dtypes(include=["int64", "float64"]).columns.tolist()
+    @staticmethod
+    def forecast_expenses(
+        df: pd.DataFrame,
+        periods: int = 30
+    ):
 
-    # convert possible numeric columns if PDF
-    for col in df.columns:
-        df[col] = pd.to_numeric(df[col], errors="ignore")
+        if len(df) < 10:
+            return pd.DataFrame(), 0.0
 
-    numeric_cols = df.select_dtypes(include=["int64", "float64"]).columns.tolist()
+        daily = (
+            df.groupby("Date")["Amount"]
+            .sum()
+            .reset_index()
+        )
 
-    if not numeric_cols:
-        st.error("No numeric column found.")
-        st.stop()
+        daily.columns = ["ds", "y"]
 
-    transaction_col = st.selectbox("Select description column", text_cols)
-    amount_col = st.selectbox("Select amount column", numeric_cols)
+        daily["ds"] = pd.to_datetime(daily["ds"])
 
-    df[transaction_col] = df[transaction_col].astype(str).str.lower().str.strip()
-    df[amount_col] = pd.to_numeric(df[amount_col], errors="coerce")
+        daily = daily.sort_values("ds")
 
-    df = df.dropna(subset=[transaction_col, amount_col])
+        daily = daily.dropna()
 
-    if st.button("Run Analysis"):
+        if len(daily) < 10:
+            return pd.DataFrame(), 0.0
 
-        categories = []
-        confidences = []
+        model = Prophet(
+            yearly_seasonality=False,
+            weekly_seasonality=True,
+            daily_seasonality=False
+        )
 
-        for desc in df[transaction_col]:
+        model.fit(daily)
 
-            prompt = f"""
-            Categorize this expense into one of these categories:
-            {cat}
+        future = model.make_future_dataframe(
+            periods=periods
+        )
 
-            Return ONLY valid JSON:
-            {{
-                "category": "<category>",
-                "confidence": <number between 0 and 1>
-            }}
+        forecast = model.predict(future)
 
-            Transaction: "{desc}"
-            """
+        next_month_prediction = (
+            forecast.tail(periods)["yhat"]
+            .clip(lower=0)
+            .sum()
+        )
 
-            try:
-                response = model.generate_content(prompt)
-                parsed = json.loads(response.text.strip())
-
-                category = parsed.get("category", "Other")
-                confidence = parsed.get("confidence", 0.5)
-
-                if category not in cat:
-                    category = "Other"
-
-            except:
-                category = "Other"
-                confidence = 0.5
-
-            categories.append(category)
-            confidences.append(confidence)
-
-        df["Predicted_Category"] = categories
-        df["Confidence"] = confidences
-
-        st.subheader("Categorized Data")
-        st.dataframe(df)
-
-        # anomaly detection
-        anomalies = []
-
-        mean = df[amount_col].mean()
-        std = df[amount_col].std()
-        threshold = mean + (2 * std)
-
-        for index, row in df.iterrows():
-            if row[amount_col] > threshold:
-                anomalies.append({
-                    "Description": row[transaction_col],
-                    "Amount": row[amount_col],
-                    "Issue": "High Amount"
-                })
-
-        anomaly_df = pd.DataFrame(anomalies)
-
-        st.subheader("Summary Report")
-
-        total = df[amount_col].sum()
-        st.write(f"Total Amount: {round(total, 2)}")
-
-        summary = df.groupby("Predicted_Category")[amount_col].sum()
-        st.bar_chart(summary)
-
-        st.subheader("Anomalies")
-
-        if len(anomaly_df) > 0:
-            st.dataframe(anomaly_df)
-        else:
-            st.success("No anomalies detected")
+        return forecast, round(float(next_month_prediction), 2)
